@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "defaultUnitPrice": 0,
+  "byAdId": {
+    "1755": 12000,
+    "325": 1000
+  }
+}
