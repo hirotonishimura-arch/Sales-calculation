@@ -78,7 +78,7 @@ async function clickNextPage(page) {
     const el = await page.$(sel);
     if (el) {
       await Promise.all([
-        page.waitForNavigation({ waitUntil: "networkidle2" }).catch(() => null),
+        page.waitForNavigation({ waitUntil: "networkidle2", timeout: 5000 }).catch(() => null),
         el.click(),
       ]);
       await sleep(800);
@@ -265,25 +265,33 @@ async function main() {
   const SLACK_WEBHOOK_URL = mustEnv("SLACK_WEBHOOK_URL", process.env.SLACK_WEBHOOK_URL);
   const CV_LOG_URL = mustEnv("CV_LOG_URL", process.env.CV_LOG_URL);
 
-  // ログイン情報（あなたが提示したnameに合わせる）
+  // ログイン情報
   const LOGIN_URL = process.env.LOGIN_URL || "https://admin.adservice.jp/";
-  const AFTER_LOGIN_URL_PREFIX = process.env.AFTER_LOGIN_URL_PREFIX || "https://admin.adservice.jp/partneradmin/";
+  const AFTER_LOGIN_URL_PREFIX =
+    process.env.AFTER_LOGIN_URL_PREFIX || "https://admin.adservice.jp/partneradmin/";
 
   const USERNAME_SELECTOR = process.env.USERNAME_SELECTOR || 'input[name="loginId"]';
   const PASSWORD_SELECTOR = process.env.PASSWORD_SELECTOR || 'input[name="password"]';
-  const SUBMIT_SELECTOR = process.env.SUBMIT_SELECTOR || 'button[type="submit"], input[type="submit"]';
+  const SUBMIT_SELECTOR =
+    process.env.SUBMIT_SELECTOR || 'button[type="submit"], input[type="submit"]';
 
-  // テーブルヘッダー名（スクショ基準のデフォルト）
+  // テーブルヘッダー名
   const headerMap = {
     orderAt: process.env.HEADER_ORDER_AT || "注文日時",
     clickAt: process.env.HEADER_CLICK_AT || "クリック日時",
     adId: process.env.HEADER_AD_ID || "広告ID",
     adName: process.env.HEADER_AD_NAME || "広告名",
-    siteName: process.env.HEADER_SITE_NAME || "サイト名"
+    siteName: process.env.HEADER_SITE_NAME || "サイト名",
   };
 
   // state / prices
-  const state = readJson(STATE_FILE, { version: 1, initialized: false, seenKeys: [], monthly: {}, updatedAt: null });
+  const state = readJson(STATE_FILE, {
+    version: 1,
+    initialized: false,
+    seenKeys: [],
+    monthly: {},
+    updatedAt: null,
+  });
   const prices = readJson(PRICE_FILE, null);
   if (!prices) throw new Error("prices.json not found or invalid");
 
@@ -294,7 +302,6 @@ async function main() {
     args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--no-zygote"],
   });
 
-  let rows = [];
   try {
     const page = await browser.newPage();
     page.setDefaultTimeout(60000);
@@ -311,7 +318,7 @@ async function main() {
       page.click(SUBMIT_SELECTOR),
     ]);
 
-    // login success check (URL)
+    // login success check
     await sleep(800);
     if (!page.url().startsWith(AFTER_LOGIN_URL_PREFIX)) {
       throw new Error(`Login seems failed. current url=${page.url()}`);
@@ -320,11 +327,113 @@ async function main() {
     // go cv log page
     await page.goto(CV_LOG_URL, { waitUntil: "networkidle2" });
 
-    // extract rows
-    rows = await extractRowsFromBestTable(page, headerMap);
+    // ✅ 初回（initialized=false）のときは「今月分をページングで集めて月次合計を作る」
+    if (!state.initialized) {
+      const maxPages = Number(process.env.MAX_PAGES || 50);
+      const monthRows = await collectThisMonthRows(page, headerMap, prices, maxPages);
+
+      // 重複除去（念のため）
+      const uniq = [];
+      const keySet = new Set();
+      for (const x of monthRows) {
+        if (!keySet.has(x.key)) {
+          keySet.add(x.key);
+          uniq.push(x);
+        }
+      }
+
+      // monthly 初期化（今月分）
+      const nowMonth = getNowMonthKeyJst();
+      state.monthly = state.monthly || {};
+      state.monthly[nowMonth] = { revenue: 0, count: 0 };
+      for (const x of uniq) {
+        state.monthly[nowMonth].count += 1;
+        state.monthly[nowMonth].revenue += x.unit;
+      }
+
+      // 既知キー登録
+      state.seenKeys = pruneSeen((state.seenKeys || []).concat(uniq.map((x) => x.key)));
+      state.initialized = true;
+
+      writeJson(STATE_FILE, state);
+      console.log(`[INFO] Bootstrapped month total from ${uniq.length} rows (no notify).`);
+      return;
+    }
+
+    // ✅ 通常時：まずは「今見えてる1ページ（20件）」から新規CVだけ拾う
+    const rows = await extractRowsFromBestTable(page, headerMap);
+
+    const normalized = rows
+      .map((r) => {
+        const orderAt = norm(r.orderAt);
+        const clickAt = norm(r.clickAt);
+        const adId = norm(r.adId);
+        const adName = norm(r.adName);
+        const siteName = norm(r.siteName);
+        if (!orderAt || !adId) return null;
+
+        const key = sha1(`${orderAt}|${clickAt}|${adId}|${siteName}`);
+        const unit = getUnitPrice(prices, adId);
+        const monthKey = monthKeyFrom(orderAt);
+        return { key, orderAt, adId, adName, siteName, unit, monthKey };
+      })
+      .filter(Boolean);
+
+    const newOnes = normalized.filter((x) => !seenSet.has(x.key));
+
+    if (newOnes.length === 0) {
+      console.log("[INFO] No new CV. No notify.");
+      return;
+    }
+
+    // 月次合計更新（単価で加算）
+    state.monthly = state.monthly || {};
+    const unknown = [];
+
+    for (const x of newOnes) {
+      if (x.unit === 0 && !(prices.byAdId && prices.byAdId[String(x.adId)] != null)) {
+        unknown.push(`${x.adId} ${x.adName}`);
+      }
+      const cur = state.monthly[x.monthKey] || { revenue: 0, count: 0 };
+      cur.count += 1;
+      cur.revenue += x.unit;
+      state.monthly[x.monthKey] = cur;
+    }
+
+    // 通知（1CV=1通）
+    for (const x of newOnes) {
+      const monthTotal = state.monthly[x.monthKey] || { revenue: 0, count: 0 };
+      const unitStr = x.unit > 0 ? fmtYen(x.unit) : "未設定（prices.jsonに追加してください）";
+
+      const msg =
+        `🎉 新しい成果が発生しました！\n\n` +
+        `日時: ${x.orderAt}\n` +
+        `案件: ${x.adName || "(不明)"}\n` +
+        `サイト: ${x.siteName || "(不明)"}\n` +
+        `報酬単価: ${unitStr}\n` +
+        `今月の売上合計（現在）: ${fmtYen(monthTotal.revenue)}（${x.monthKey}）\n` +
+        `管理画面を確認する: <${CV_LOG_URL}|管理画面を確認する>`;
+
+      await postSlack(SLACK_WEBHOOK_URL, msg);
+    }
+
+    if (unknown.length > 0) {
+      const warn =
+        `⚠️ 単価が未設定の広告IDがあります（prices.jsonに追加してください）\n` +
+        unknown.slice(0, 20).map((s) => `- ${s}`).join("\n");
+      await postSlack(SLACK_WEBHOOK_URL, warn);
+    }
+
+    // state保存
+    state.seenKeys = pruneSeen((state.seenKeys || []).concat(newOnes.map((x) => x.key)));
+    writeJson(STATE_FILE, state);
+
+    console.log(`[INFO] Notified ${newOnes.length} CV(s) and updated state.`);
   } finally {
     await browser.close().catch(() => {});
   }
+}
+
 
   // 正規化 & キー作成（ステータス等の変動要素は含めない）
   const normalized = rows
