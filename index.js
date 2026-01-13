@@ -258,13 +258,28 @@ async function main() {
   const newOnes = normalized.filter((x) => !seenSet.has(x.key));
 
   // 初回は通知せず“既存分を既知として登録”して事故を防ぐ
-  if (!state.initialized) {
-    state.initialized = true;
-    state.seenKeys = pruneSeen((state.seenKeys || []).concat(newOnes.map((x) => x.key)));
-    writeJson(STATE_FILE, state);
-    console.log(`[INFO] Bootstrapped state (no notify). newRows=${newOnes.length}`);
-    return;
+if (!state.initialized) {
+  state.initialized = true;
+
+  // 既存行を全部「既知」として登録
+  state.seenKeys = pruneSeen(
+    (state.seenKeys || []).concat(normalized.map((x) => x.key))
+  );
+
+  // ★ここが追加：月次集計を初期化（既存CVも含める）
+  state.monthly = state.monthly || {};
+  for (const x of normalized) {
+    const cur = state.monthly[x.monthKey] || { revenue: 0, count: 0 };
+    cur.count += 1;
+    cur.revenue += x.unit;
+    state.monthly[x.monthKey] = cur;
   }
+
+  writeJson(STATE_FILE, state);
+  console.log(`[INFO] Bootstrapped state (no notify). rows=${normalized.length}`);
+  return;
+}
+
 
   if (newOnes.length === 0) {
     console.log("[INFO] No new CV. No notify.");
