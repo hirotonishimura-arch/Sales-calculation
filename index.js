@@ -8,6 +8,7 @@ const ROOT = process.cwd();
 const STATE_FILE = path.join(ROOT, "cv_data.json");
 const PRICE_FILE = path.join(ROOT, "prices.json");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const DEBUG = process.env.DEBUG === "1";
 
 function mustEnv(name, v) {
   if (!v) throw new Error(`Missing env: ${name}`);
@@ -41,9 +42,18 @@ function fmtYen(n) {
   return `${new Intl.NumberFormat("ja-JP").format(v)}円`;
 }
 
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+// ★重要：YYYY/MM, YYYY-MM, YYYY年MM月 などを確実に YYYY-MM に正規化
 function monthKeyFrom(dateTimeStr) {
   const s = norm(dateTimeStr);
-  return s.length >= 7 ? s.slice(0, 7) : "unknown";
+  const m = s.match(/(\d{4})\s*[-\/\.年]\s*(\d{1,2})/);
+  if (m) return `${m[1]}-${pad2(m[2])}`;
+  // フォールバック
+  const t = s.slice(0, 7).replace("/", "-");
+  return t.length === 7 ? t : "unknown";
 }
 
 function getNowMonthKeyJst() {
@@ -68,7 +78,6 @@ async function postSlack(webhookUrl, text) {
   }
 }
 
-// prices.json は byAdId が基本。byAdName も任意で対応。
 function getUnitPrice(prices, adId, adName) {
   const id = String(adId || "").trim();
   if (id && prices.byAdId && prices.byAdId[id] != null) return Number(prices.byAdId[id]) || 0;
@@ -79,8 +88,8 @@ function getUnitPrice(prices, adId, adName) {
   return Number(prices.defaultUnitPrice) || 0;
 }
 
-// seenKeys を「重複なし」「新しいもの優先」で保持
-function mergeSeenKeys(prev, add, maxItems = 3000) {
+// seenKeys を重複なしで保持
+function mergeSeenKeys(prev, add, maxItems = 5000) {
   const all = (prev || []).concat(add || []);
   const seen = new Set();
   const outRev = [];
@@ -107,9 +116,7 @@ function uniqByKey(items) {
   return out;
 }
 
-/**
- * 画面上のCVテーブルを特定し、行を抜く（必要列は headerMap で指定）
- */
+/** テーブル待ち（ヘッダ名で判定） */
 async function waitForCvTable(page, headerOrderAt, headerAdId, headerAdName) {
   await page.waitForFunction(
     (h1, h2, h3) => {
@@ -134,6 +141,7 @@ async function waitForCvTable(page, headerOrderAt, headerAdId, headerAdName) {
   );
 }
 
+/** もっともそれっぽいテーブルから行を抽出（rowId / href も拾う） */
 async function extractRowsFromBestTable(page, headerMap) {
   await waitForCvTable(page, headerMap.orderAt, headerMap.adId, headerMap.adName);
 
@@ -177,15 +185,25 @@ async function extractRowsFromBestTable(page, headerMap) {
       siteName: headerIndex(headers, hm.siteName),
       os: headerIndex(headers, hm.os),
       referrer: headerIndex(headers, hm.referrer),
-      status: headerIndex(headers, hm.status), // キーには使わない（変わる可能性がある）
+      status: headerIndex(headers, hm.status),
     };
 
     const rows = Array.from(best.querySelectorAll("tbody tr"));
     const data = [];
+
     for (const tr of rows) {
       const tds = Array.from(tr.querySelectorAll("td")).map((td) => norm(td.textContent));
       if (!tds.length) continue;
+
       const get = (i) => (i >= 0 ? (tds[i] ?? "") : "");
+      const rowId =
+        tr.getAttribute("data-id") ||
+        tr.getAttribute("data-row-id") ||
+        tr.getAttribute("id") ||
+        "";
+
+      const a = tr.querySelector("a[href]");
+      const href = a ? a.getAttribute("href") || "" : "";
 
       data.push({
         orderAt: get(idx.orderAt),
@@ -196,17 +214,18 @@ async function extractRowsFromBestTable(page, headerMap) {
         os: get(idx.os),
         referrer: get(idx.referrer),
         status: get(idx.status),
-        // rowText: tds.join(" | "), // デバッグに使いたければ
+        rowId: norm(rowId),
+        href: norm(href),
       });
     }
+
     return data;
   }, headerMap);
 }
 
 /**
- * キー生成を強化：同秒・同案件が続いても潰れにくいよう
- * eventAt(注文日時優先/なければクリック日時) + adId/adName + siteName + os + referrer を使う
- * ※ status は変わり得るので key には入れない
+ * ★キーを強化：rowId/href があれば必ず使う
+ * それが無い場合でも、eventAt + ad + site + os + referrer で衝突を減らす
  */
 function normalizeRows(rows, prices) {
   return (rows || [])
@@ -221,14 +240,20 @@ function normalizeRows(rows, prices) {
       const os = norm(r.os);
       const referrer = norm(r.referrer);
 
-      // adId が空でも adName があれば拾う（単価は byAdName でも対応可）
+      const rowId = norm(r.rowId);
+      const href = norm(r.href);
+
       const adKey = adId || adName;
       if (!eventAt || !adKey) return null;
 
-      const unit = getUnitPrice(prices, adId, adName);
       const monthKey = monthKeyFrom(eventAt);
+      const unit = getUnitPrice(prices, adId, adName);
 
-      const keySource = `${eventAt}|${adKey}|${siteName}|${os}|${referrer}|${adName}`;
+      // rowId/href が取れるならそれを含めて一意性を上げる
+      const keySource =
+        (rowId || href ? `${rowId}|${href}|` : "") +
+        `${eventAt}|${adKey}|${adName}|${siteName}|${os}|${referrer}`;
+
       const key = sha1(keySource);
 
       return { key, eventAt, orderAt, clickAt, adId, adName, siteName, os, referrer, unit, monthKey };
@@ -236,15 +261,14 @@ function normalizeRows(rows, prices) {
     .filter(Boolean);
 }
 
-/**
- * ページングが本当に進んだか判定するための「テーブル署名」
- */
+/** ページ移動判定用の署名（dataTables_info + 先頭/末尾行） */
 async function getTableSignature(page, headerMap) {
   return await page
     .evaluate((hm) => {
       const norm = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
-      const tables = Array.from(document.querySelectorAll("table"));
+      const info = norm(document.querySelector(".dataTables_info")?.textContent || "");
 
+      const tables = Array.from(document.querySelectorAll("table"));
       function scoreTable(t) {
         const headers = Array.from(t.querySelectorAll("thead th")).map((x) => norm(x.textContent));
         const need = [hm.orderAt, hm.adId, hm.adName];
@@ -256,24 +280,20 @@ async function getTableSignature(page, headerMap) {
         const rows = t.querySelectorAll("tbody tr").length;
         return score * 1000 + rows;
       }
-
       const best = tables
         .map((t) => ({ t, s: scoreTable(t) }))
         .sort((a, b) => b.s - a.s)[0]?.t;
-
-      if (!best) return "";
+      if (!best) return info;
 
       const trs = Array.from(best.querySelectorAll("tbody tr"));
       const first = trs[0]?.innerText || "";
       const last = trs[trs.length - 1]?.innerText || "";
-      return `${first}||${last}`.slice(0, 2000);
+      return `${info}||${first}||${last}`.slice(0, 3000);
     }, headerMap)
     .catch(() => "");
 }
 
-/**
- * 次ページへ進めるなら進む。進めなかったら false。
- */
+/** 次ページへ進める（進めなければ false） */
 async function clickNextPage(page, headerMap) {
   const before = await getTableSignature(page, headerMap);
 
@@ -290,40 +310,37 @@ async function clickNextPage(page, headerMap) {
     await fnClick();
     await Promise.race([
       page.waitForNavigation({ waitUntil: "networkidle2", timeout: 5000 }).catch(() => null),
-      page
-        .waitForFunction(
-          (hm, prev) => {
-            const norm = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
-            const tables = Array.from(document.querySelectorAll("table"));
-
-            function scoreTable(t) {
-              const headers = Array.from(t.querySelectorAll("thead th")).map((x) => norm(x.textContent));
-              const need = [hm.orderAt, hm.adId, hm.adName];
-              let score = 0;
-              for (const n of need) {
-                if (!n) continue;
-                if (headers.some((h) => h === n || h.includes(n))) score += 1;
-              }
-              const rows = t.querySelectorAll("tbody tr").length;
-              return score * 1000 + rows;
+      page.waitForFunction(
+        (hm, prev) => {
+          const norm = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
+          const info = norm(document.querySelector(".dataTables_info")?.textContent || "");
+          const tables = Array.from(document.querySelectorAll("table"));
+          function scoreTable(t) {
+            const headers = Array.from(t.querySelectorAll("thead th")).map((x) => norm(x.textContent));
+            const need = [hm.orderAt, hm.adId, hm.adName];
+            let score = 0;
+            for (const n of need) {
+              if (!n) continue;
+              if (headers.some((h) => h === n || h.includes(n))) score += 1;
             }
+            const rows = t.querySelectorAll("tbody tr").length;
+            return score * 1000 + rows;
+          }
+          const best = tables
+            .map((t) => ({ t, s: scoreTable(t) }))
+            .sort((a, b) => b.s - a.s)[0]?.t;
+          if (!best) return info && info !== prev;
 
-            const best = tables
-              .map((t) => ({ t, s: scoreTable(t) }))
-              .sort((a, b) => b.s - a.s)[0]?.t;
-
-            if (!best) return false;
-            const trs = Array.from(best.querySelectorAll("tbody tr"));
-            const first = trs[0]?.innerText || "";
-            const last = trs[trs.length - 1]?.innerText || "";
-            const sig = `${first}||${last}`.slice(0, 2000);
-            return sig && sig !== prev;
-          },
-          { timeout: 5000 },
-          headerMap,
-          before
-        )
-        .catch(() => null),
+          const trs = Array.from(best.querySelectorAll("tbody tr"));
+          const first = trs[0]?.innerText || "";
+          const last = trs[trs.length - 1]?.innerText || "";
+          const sig = `${info}||${first}||${last}`.slice(0, 3000);
+          return sig && sig !== prev;
+        },
+        { timeout: 5000 },
+        headerMap,
+        before
+      ).catch(() => null),
     ]);
 
     await sleep(300);
@@ -364,24 +381,54 @@ async function clickNextPage(page, headerMap) {
   return movedByText;
 }
 
+/** UIに “総件数” 表示があれば拾う（デバッグ用） */
+async function detectTotalCountIfPossible(page) {
+  const t = await page.$eval(".dataTables_info", (el) => el.textContent || "").catch(() => "");
+  const s = norm(t);
+  if (!s) return null;
+
+  // "Showing 1 to 20 of 79 entries"
+  let m = s.match(/of\s+([\d,]+)\s+entries/i);
+  if (m) return parseInt(m[1].replace(/,/g, ""), 10);
+
+  // "全79件"
+  m = s.match(/全\s*([\d,]+)\s*件/);
+  if (m) return parseInt(m[1].replace(/,/g, ""), 10);
+
+  // "79件中"
+  m = s.match(/([\d,]+)\s*件中/);
+  if (m) return parseInt(m[1].replace(/,/g, ""), 10);
+
+  return null;
+}
+
 /**
- * 初回：今月分を全部拾う（ページの終端まで辿る / “今月が出なくなったら終了”）
+ * 初回：今月分をページングで集める
+ * - 「今月行が0件のページ」が出たら終了（今月の並び順前提）
+ * - 次へが無ければその時点で終了
  */
 async function collectThisMonthRows(page, headerMap, prices, maxPages = 50) {
   const targetMonth = getNowMonthKeyJst();
   const out = [];
+  let foundAny = false;
 
   for (let p = 0; p < maxPages; p++) {
     const rows = await extractRowsFromBestTable(page, headerMap);
     const normalized = normalizeRows(rows, prices);
 
     const inMonth = normalized.filter((x) => x.monthKey === targetMonth);
-    out.push(...inMonth);
+    if (DEBUG) {
+      const months = [...new Set(normalized.map((x) => x.monthKey))].slice(0, 5).join(",");
+      console.log(`[DEBUG] page=${p + 1} extracted=${normalized.length} inMonth=${inMonth.length} months=[${months}]`);
+    }
 
-    // このページが全部 “前月以前” なら、ここで終わり（並び順が多少怪しくても安全寄り）
-    const hasAny = normalized.length > 0;
-    const allOlder = hasAny && normalized.every((x) => x.monthKey < targetMonth);
-    if (allOlder) break;
+    if (inMonth.length > 0) {
+      foundAny = true;
+      out.push(...inMonth);
+    } else if (foundAny) {
+      // 今月が出なくなった＝月境界を超えたとみなして終了
+      break;
+    }
 
     const moved = await clickNextPage(page, headerMap);
     if (!moved) break;
@@ -390,11 +437,10 @@ async function collectThisMonthRows(page, headerMap, prices, maxPages = 50) {
   return uniqByKey(out);
 }
 
-/**
- * 通常：新規が無くなるまでページを辿る（>20件バースト対策）
- */
+/** 通常：新規が無くなるまでページを辿る（バースト対策） */
 async function collectNewRowsUntilSeen(page, headerMap, prices, seenSet, maxPages = 10) {
   const out = [];
+
   for (let p = 0; p < maxPages; p++) {
     const rows = await extractRowsFromBestTable(page, headerMap);
     const normalized = normalizeRows(rows, prices);
@@ -407,32 +453,14 @@ async function collectNewRowsUntilSeen(page, headerMap, prices, seenSet, maxPage
       }
     }
 
-    if (newCount === 0) break;
+    if (DEBUG) console.log(`[DEBUG] normal page=${p + 1} extracted=${normalized.length} newInPage=${newCount}`);
 
+    if (newCount === 0) break;
     const moved = await clickNextPage(page, headerMap);
     if (!moved) break;
   }
+
   return uniqByKey(out);
-}
-
-async function detectTotalCountIfPossible(page) {
-  // DataTables系の「xx件中」表示があれば拾ってログに出す（無ければ無視）
-  const txt = await page.$eval(".dataTables_info", (el) => el.textContent || "").catch(() => "");
-  const t = norm(txt);
-  if (!t) return null;
-
-  // 英語: "Showing 1 to 20 of 79 entries"
-  let m = t.match(/of\s+([\d,]+)\s+entries/i);
-  if (m) return parseInt(m[1].replace(/,/g, ""), 10);
-
-  // 日本語: "全79件" や "79件中"
-  m = t.match(/全\s*([\d,]+)\s*件/);
-  if (m) return parseInt(m[1].replace(/,/g, ""), 10);
-
-  m = t.match(/([\d,]+)\s*件中/);
-  if (m) return parseInt(m[1].replace(/,/g, ""), 10);
-
-  return null;
 }
 
 async function main() {
@@ -448,7 +476,6 @@ async function main() {
   const PASSWORD_SELECTOR = process.env.PASSWORD_SELECTOR || 'input[name="password"]';
   const SUBMIT_SELECTOR = process.env.SUBMIT_SELECTOR || 'button[type="submit"], input[type="submit"]';
 
-  // CV明細テーブルのヘッダ名（必要なら env で上書き）
   const headerMap = {
     orderAt: process.env.HEADER_ORDER_AT || "注文日時",
     clickAt: process.env.HEADER_CLICK_AT || "クリック日時",
@@ -476,7 +503,6 @@ async function main() {
     page.setDefaultTimeout(60000);
     page.setDefaultNavigationTimeout(60000);
 
-    // login
     await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
     await page.waitForSelector(USERNAME_SELECTOR);
     await page.type(USERNAME_SELECTOR, ADSERVICE_ID, { delay: 10 });
@@ -494,19 +520,12 @@ async function main() {
 
     await page.goto(CV_LOG_URL, { waitUntil: "networkidle2" });
 
-    const total = await detectTotalCountIfPossible(page);
-    if (total != null) console.log(`[INFO] Detected total entries (from UI): ${total}`);
+    const uiTotal = await detectTotalCountIfPossible(page);
+    if (uiTotal != null) console.log(`[INFO] Detected total entries (from UI): ${uiTotal}`);
 
-    // 初回：今月分をページング収集して月次合計を作る（通知しない）
     if (!state.initialized) {
       const maxPages = Number(process.env.MAX_PAGES || 50);
       const monthRows = await collectThisMonthRows(page, headerMap, prices, maxPages);
-
-      // もし key 衝突がまだ起きてたらログで気づけるように
-      const keyCount = new Map();
-      for (const x of monthRows) keyCount.set(x.key, (keyCount.get(x.key) || 0) + 1);
-      const dup = [...keyCount.entries()].filter(([, c]) => c > 1);
-      if (dup.length > 0) console.warn(`[WARN] Duplicate keys still exist in monthRows: ${dup.length} keys`);
 
       const nowMonth = getNowMonthKeyJst();
       state.monthly ||= {};
@@ -525,7 +544,6 @@ async function main() {
       return;
     }
 
-    // 通常：新規を複数ページから拾う（バースト対策）
     const maxPagesNormal = Number(process.env.MAX_PAGES_NORMAL || 10);
     const newOnes = await collectNewRowsUntilSeen(page, headerMap, prices, seenSet, maxPagesNormal);
 
@@ -552,7 +570,6 @@ async function main() {
       state.monthly[x.monthKey] = cur;
     }
 
-    // 通知（1CV=1通）
     for (const x of newOnes) {
       const monthTotal = state.monthly[x.monthKey] || { revenue: 0, count: 0 };
       const unitStr = x.unit > 0 ? fmtYen(x.unit) : "未設定（prices.jsonに追加してください）";
