@@ -1,4 +1,4 @@
-// index.js (Node.js 20推奨)
+// index.js (Node.js 20推奨 / CommonJS)
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
@@ -46,11 +46,22 @@ function monthKeyFrom(orderAtStr) {
   return s.length >= 7 ? s.slice(0, 7) : "unknown";
 }
 
+function getNowMonthKeyJst() {
+  const d = new Date();
+  const y = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+  }).format(d);
+  const m = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Tokyo",
+    month: "2-digit",
+  }).format(d);
+  return `${y}-${m}`;
+}
+
 async function postSlack(webhookUrl, text) {
   const payload = { text };
-  // channelを後で差し込みたい場合：
-  // Incoming Webhookは通常チャンネル固定で、この指定は無視されることが多いです。
-  // ただ、許可されているWebhookなら効くので「入れておいて害は少ない」ため任意対応にしています。
+  // Incoming Webhookは通常チャンネル固定（必要なら後でSlack App側で作り直し）
   if (process.env.SLACK_CHANNEL) payload.channel = process.env.SLACK_CHANNEL;
 
   const res = await fetch(webhookUrl, {
@@ -63,7 +74,21 @@ async function postSlack(webhookUrl, text) {
     throw new Error(`Slack webhook failed: ${res.status} ${res.statusText} ${body}`);
   }
 }
-// 次ページへ進めるなら進む（色んなUIに対応するため候補を複数試す）
+
+function getUnitPrice(prices, adId) {
+  const id = String(adId || "").trim();
+  if (id && prices.byAdId && prices.byAdId[id] != null) return Number(prices.byAdId[id]) || 0;
+  return Number(prices.defaultUnitPrice) || 0;
+}
+
+function pruneSeen(seenKeys, maxItems = 3000) {
+  if (!Array.isArray(seenKeys)) return [];
+  return seenKeys.slice(-maxItems);
+}
+
+/**
+ * 次ページへ進めるなら進む（遷移/非遷移どちらでも耐える）
+ */
 async function clickNextPage(page) {
   const selectors = [
     'a.paginate_button.next:not(.disabled)',
@@ -74,101 +99,78 @@ async function clickNextPage(page) {
     'a[aria-label="Next"]:not(.disabled)',
   ];
 
+  const beforeFirstRow = await page
+    .evaluate(() => {
+      const tr = document.querySelector("tbody tr");
+      return tr ? (tr.innerText || "") : "";
+    })
+    .catch(() => "");
+
+  async function waitForChangeOrNav() {
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 5000 }).catch(() => null),
+      page
+        .waitForFunction(
+          (prev) => {
+            const tr = document.querySelector("tbody tr");
+            if (!tr) return false;
+            const now = tr.innerText || "";
+            return now && now !== prev;
+          },
+          { timeout: 5000 },
+          beforeFirstRow
+        )
+        .catch(() => null),
+    ]);
+    await sleep(500);
+  }
+
+  // セレクタ優先
   for (const sel of selectors) {
     const el = await page.$(sel);
-    if (el) {
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: "networkidle2", timeout: 5000 }).catch(() => null),
-        el.click(),
-      ]);
-      await sleep(800);
-      return true;
-    }
+    if (!el) continue;
+
+    await el.click().catch(() => null);
+    await waitForChangeOrNav();
+    return true;
   }
 
   // 文字で探すフォールバック（次へ/Next）
-  const clicked = await page.evaluate(() => {
-    const isDisabled = (el) => {
-      const cls = (el.getAttribute("class") || "").toLowerCase();
-      if (cls.includes("disabled")) return true;
-      if (el.getAttribute("aria-disabled") === "true") return true;
-      if (el.disabled) return true;
-      return false;
-    };
+  const clicked = await page
+    .evaluate(() => {
+      const isDisabled = (el) => {
+        const cls = (el.getAttribute("class") || "").toLowerCase();
+        if (cls.includes("disabled")) return true;
+        if (el.getAttribute("aria-disabled") === "true") return true;
+        if (el.disabled) return true;
+        return false;
+      };
 
-    const candidates = Array.from(document.querySelectorAll("a,button"));
-    const next = candidates.find((el) => {
-      const t = (el.textContent || "").trim();
-      if (!(t === "次へ" || t === "Next" || t === "›" || t === ">")) return false;
-      if (isDisabled(el)) return false;
-      const r = el.getBoundingClientRect();
-      return r.width > 0 && r.height > 0;
-    });
+      const candidates = Array.from(document.querySelectorAll("a,button"));
+      const next = candidates.find((el) => {
+        const t = (el.textContent || "").trim();
+        if (!(t === "次へ" || t === "Next" || t === "›" || t === ">")) return false;
+        if (isDisabled(el)) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
 
-    if (!next) return false;
-    next.click();
-    return true;
-  });
+      if (!next) return false;
+      next.click();
+      return true;
+    })
+    .catch(() => false);
 
   if (clicked) {
-    await sleep(800);
+    await waitForChangeOrNav();
     return true;
   }
   return false;
 }
-function getNowMonthKeyJst() {
-  const d = new Date();
-  const y = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Tokyo", year: "numeric" }).format(d);
-  const m = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Tokyo", month: "2-digit" }).format(d);
-  return `${y}-${m}`;
-}
 
-// “今月分” が尽きる（=前月が出てくる）までページングして集める
-async function collectThisMonthRows(page, headerMap, prices, maxPages = 50) {
-  const targetMonth = getNowMonthKeyJst();
-  const collected = [];
-
-  for (let p = 0; p < maxPages; p++) {
-    const rows = await extractRowsFromBestTable(page, headerMap); // 既にあなたのコードにあるやつ
-    const normalized = rows
-      .map((r) => {
-        const orderAt = norm(r.orderAt);
-        const clickAt = norm(r.clickAt);
-        const adId = norm(r.adId);
-        const adName = norm(r.adName);
-        const siteName = norm(r.siteName);
-        if (!orderAt || !adId) return null;
-        const key = sha1(`${orderAt}|${clickAt}|${adId}|${siteName}`);
-        const monthKey = monthKeyFrom(orderAt);
-        const unit = getUnitPrice(prices, adId);
-        return { key, orderAt, adId, adName, siteName, monthKey, unit };
-      })
-      .filter(Boolean);
-
-    // 今月分だけ加える。前月が出てきたら終了（降順ソート前提）
-    for (const x of normalized) {
-      if (x.monthKey < targetMonth) return collected;
-      if (x.monthKey === targetMonth) collected.push(x);
-    }
-
-    const moved = await clickNextPage(page);
-    if (!moved) return collected;
-  }
-  return collected;
-}
-
-function getUnitPrice(prices, adId) {
-  const id = String(adId || "").trim();
-  if (id && prices.byAdId && prices.byAdId[id] != null) return Number(prices.byAdId[id]) || 0;
-  return Number(prices.defaultUnitPrice) || 0;
-}
-
-function pruneSeen(seenKeys, maxItems = 3000) {
-  // シンプルに最大数で切る（5分おき監視ならこれで十分）
-  if (!Array.isArray(seenKeys)) return [];
-  return seenKeys.slice(-maxItems);
-}
-
+/**
+ * CVテーブルが描画されるのを待つ（ヘッダ名で判定）
+ */
 async function waitForCvTable(page, headerOrderAt, headerAdId, headerAdName) {
   await page.waitForFunction(
     (h1, h2, h3) => {
@@ -193,12 +195,14 @@ async function waitForCvTable(page, headerOrderAt, headerAdId, headerAdName) {
   );
 }
 
+/**
+ * 画面上の「最もそれっぽいテーブル」から行を抜く
+ */
 async function extractRowsFromBestTable(page, headerMap) {
   await waitForCvTable(page, headerMap.orderAt, headerMap.adId, headerMap.adName);
 
   return await page.evaluate((hm) => {
     const norm = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
-
     const tables = Array.from(document.querySelectorAll("table"));
 
     function headerIndex(headers, target) {
@@ -217,7 +221,7 @@ async function extractRowsFromBestTable(page, headerMap) {
         if (headers.some((h) => h === n || h.includes(n))) score += 1;
       }
       const rows = t.querySelectorAll("tbody tr").length;
-      return score * 1000 + rows; // スコア優先、同点なら行数多い方
+      return score * 1000 + rows;
     }
 
     const best = tables
@@ -233,7 +237,7 @@ async function extractRowsFromBestTable(page, headerMap) {
       clickAt: hm.clickAt ? headerIndex(headers, hm.clickAt) : -1,
       adId: headerIndex(headers, hm.adId),
       adName: headerIndex(headers, hm.adName),
-      siteName: hm.siteName ? headerIndex(headers, hm.siteName) : -1
+      siteName: hm.siteName ? headerIndex(headers, hm.siteName) : -1,
     };
 
     const rows = Array.from(best.querySelectorAll("tbody tr"));
@@ -250,12 +254,96 @@ async function extractRowsFromBestTable(page, headerMap) {
         clickAt: get(idx.clickAt),
         adId: get(idx.adId),
         adName: get(idx.adName),
-        siteName: get(idx.siteName)
+        siteName: get(idx.siteName),
       });
     }
 
     return data;
   }, headerMap);
+}
+
+/**
+ * rows -> 正規化（key/unit/monthKey 付与）
+ */
+function normalizeRows(rows, prices) {
+  return rows
+    .map((r) => {
+      const orderAt = norm(r.orderAt);
+      const clickAt = norm(r.clickAt);
+      const adId = norm(r.adId);
+      const adName = norm(r.adName);
+      const siteName = norm(r.siteName);
+
+      if (!orderAt || !adId) return null;
+
+      const key = sha1(`${orderAt}|${clickAt}|${adId}|${siteName}`);
+      const unit = getUnitPrice(prices, adId);
+      const monthKey = monthKeyFrom(orderAt);
+
+      return { key, orderAt, clickAt, adId, adName, siteName, unit, monthKey };
+    })
+    .filter(Boolean);
+}
+
+/**
+ * 初回：今月分が尽きる（=前月が出る）までページングして集める
+ * ※ ページに「次へ」が無い場合は 1ページ（最大20件）で終了します。
+ */
+async function collectThisMonthRows(page, headerMap, prices, maxPages = 50) {
+  const targetMonth = getNowMonthKeyJst();
+  const collected = [];
+
+  for (let p = 0; p < maxPages; p++) {
+    const rows = await extractRowsFromBestTable(page, headerMap);
+    const normalized = normalizeRows(rows, prices);
+
+    for (const x of normalized) {
+      if (x.monthKey < targetMonth) return collected; // 前月が出たら終了
+      if (x.monthKey === targetMonth) collected.push(x);
+    }
+
+    const moved = await clickNextPage(page);
+    if (!moved) return collected;
+  }
+  return collected;
+}
+
+/**
+ * 通常運用：新規CVが20件を超える可能性があるので、
+ * 「新規がなくなるまで」複数ページを辿って拾う（安全策）
+ */
+async function collectNewRowsUntilSeen(page, headerMap, prices, seenSet, maxPages = 10) {
+  const collected = [];
+
+  for (let p = 0; p < maxPages; p++) {
+    const rows = await extractRowsFromBestTable(page, headerMap);
+    const normalized = normalizeRows(rows, prices);
+
+    let newInPage = 0;
+    for (const x of normalized) {
+      if (!seenSet.has(x.key)) {
+        collected.push(x);
+        newInPage += 1;
+      }
+    }
+
+    // このページに新規が1件も無い = もう過去領域なので終了
+    if (newInPage === 0) break;
+
+    const moved = await clickNextPage(page);
+    if (!moved) break;
+  }
+
+  // 念のため重複除去
+  const uniq = [];
+  const ks = new Set();
+  for (const x of collected) {
+    if (!ks.has(x.key)) {
+      ks.add(x.key);
+      uniq.push(x);
+    }
+  }
+  return uniq;
 }
 
 async function main() {
@@ -275,7 +363,7 @@ async function main() {
   const SUBMIT_SELECTOR =
     process.env.SUBMIT_SELECTOR || 'button[type="submit"], input[type="submit"]';
 
-  // テーブルヘッダー名
+  // テーブルヘッダー名（必要なら env で上書き）
   const headerMap = {
     orderAt: process.env.HEADER_ORDER_AT || "注文日時",
     clickAt: process.env.HEADER_CLICK_AT || "クリック日時",
@@ -327,59 +415,31 @@ async function main() {
     // go cv log page
     await page.goto(CV_LOG_URL, { waitUntil: "networkidle2" });
 
-    // ✅ 初回（initialized=false）のときは「今月分をページングで集めて月次合計を作る」
+    // 初回：今月分をページングして月次合計を作る（通知しない）
     if (!state.initialized) {
       const maxPages = Number(process.env.MAX_PAGES || 50);
       const monthRows = await collectThisMonthRows(page, headerMap, prices, maxPages);
 
-      // 重複除去（念のため）
-      const uniq = [];
-      const keySet = new Set();
-      for (const x of monthRows) {
-        if (!keySet.has(x.key)) {
-          keySet.add(x.key);
-          uniq.push(x);
-        }
-      }
-
-      // monthly 初期化（今月分）
       const nowMonth = getNowMonthKeyJst();
       state.monthly = state.monthly || {};
       state.monthly[nowMonth] = { revenue: 0, count: 0 };
-      for (const x of uniq) {
+
+      for (const x of monthRows) {
         state.monthly[nowMonth].count += 1;
         state.monthly[nowMonth].revenue += x.unit;
       }
 
-      // 既知キー登録
-      state.seenKeys = pruneSeen((state.seenKeys || []).concat(uniq.map((x) => x.key)));
+      state.seenKeys = pruneSeen((state.seenKeys || []).concat(monthRows.map((x) => x.key)));
       state.initialized = true;
 
       writeJson(STATE_FILE, state);
-      console.log(`[INFO] Bootstrapped month total from ${uniq.length} rows (no notify).`);
+      console.log(`[INFO] Bootstrapped month total from ${monthRows.length} rows (no notify).`);
       return;
     }
 
-    // ✅ 通常時：まずは「今見えてる1ページ（20件）」から新規CVだけ拾う
-    const rows = await extractRowsFromBestTable(page, headerMap);
-
-    const normalized = rows
-      .map((r) => {
-        const orderAt = norm(r.orderAt);
-        const clickAt = norm(r.clickAt);
-        const adId = norm(r.adId);
-        const adName = norm(r.adName);
-        const siteName = norm(r.siteName);
-        if (!orderAt || !adId) return null;
-
-        const key = sha1(`${orderAt}|${clickAt}|${adId}|${siteName}`);
-        const unit = getUnitPrice(prices, adId);
-        const monthKey = monthKeyFrom(orderAt);
-        return { key, orderAt, adId, adName, siteName, unit, monthKey };
-      })
-      .filter(Boolean);
-
-    const newOnes = normalized.filter((x) => !seenSet.has(x.key));
+    // 通常：新規CVを複数ページから拾う（>20件対策）
+    const maxPagesNormal = Number(process.env.MAX_PAGES_NORMAL || 10);
+    const newOnes = await collectNewRowsUntilSeen(page, headerMap, prices, seenSet, maxPagesNormal);
 
     if (newOnes.length === 0) {
       console.log("[INFO] No new CV. No notify.");
@@ -417,6 +477,7 @@ async function main() {
       await postSlack(SLACK_WEBHOOK_URL, msg);
     }
 
+    // 単価未設定の警告（任意）
     if (unknown.length > 0) {
       const warn =
         `⚠️ 単価が未設定の広告IDがあります（prices.jsonに追加してください）\n` +
@@ -432,112 +493,6 @@ async function main() {
   } finally {
     await browser.close().catch(() => {});
   }
-}
-
-
-  // 正規化 & キー作成（ステータス等の変動要素は含めない）
-  const normalized = rows
-    .map((r) => {
-      const orderAt = norm(r.orderAt);
-      const clickAt = norm(r.clickAt);
-      const adId = norm(r.adId);
-      const adName = norm(r.adName);
-      const siteName = norm(r.siteName);
-
-      if (!orderAt || !adId) return null;
-
-      // ここが「同一CV判定」の肝（statusなどは入れない）
-      const keySource = `${orderAt}|${clickAt}|${adId}|${siteName}`;
-      const key = sha1(keySource);
-
-      const unit = getUnitPrice(prices, adId);
-      const monthKey = monthKeyFrom(orderAt);
-
-      return { key, orderAt, adId, adName, siteName, unit, monthKey };
-    })
-    .filter(Boolean);
-
-  const newOnes = normalized.filter((x) => !seenSet.has(x.key));
-
-  // 初回は通知せず“既存分を既知として登録”して事故を防ぐ
-if (!state.initialized) {
-  state.initialized = true;
-
-  const maxPages = Number(process.env.MAX_PAGES || 50);
-  const monthRows = await collectThisMonthRows(page, headerMap, prices, maxPages);
-
-  // seenKeys
-  state.seenKeys = pruneSeen((state.seenKeys || []).concat(monthRows.map((x) => x.key)));
-
-  // monthly 初期化（今月分）
-  state.monthly = state.monthly || {};
-  const nowMonth = getNowMonthKeyJst();
-  state.monthly[nowMonth] = { revenue: 0, count: 0 };
-  for (const x of monthRows) {
-    state.monthly[nowMonth].count += 1;
-    state.monthly[nowMonth].revenue += x.unit;
-  }
-
-  writeJson(STATE_FILE, state);
-  console.log(`[INFO] Bootstrapped month total from ${monthRows.length} rows (no notify).`);
-  return;
-}
-
-
-
-  if (newOnes.length === 0) {
-    console.log("[INFO] No new CV. No notify.");
-    return;
-  }
-
-  // 月次合計更新（単価で加算）
-  state.monthly = state.monthly || {};
-  const unknown = [];
-
-  for (const x of newOnes) {
-    if (x.unit === 0 && !(prices.byAdId && prices.byAdId[String(x.adId)] != null)) {
-      unknown.push(`${x.adId} ${x.adName}`);
-    }
-    const cur = state.monthly[x.monthKey] || { revenue: 0, count: 0 };
-    cur.count += 1;
-    cur.revenue += x.unit;
-    state.monthly[x.monthKey] = cur;
-  }
-
-  // ここでseen更新（通知前後どっちでもOKだが、通知失敗時の二重通知を避けたいなら「通知成功後」にする）
-  // → 今回は「Slack送信成功後に保存」に寄せるので、seen更新は後で
-
-  // 通知（あなたの指定フォーマット：1CV=1通）
-  // ※ まとめ通知にしたくなったらここを変更
-  for (const x of newOnes) {
-    const monthTotal = state.monthly[x.monthKey] || { revenue: 0, count: 0 };
-    const unitStr = (x.unit && x.unit > 0) ? fmtYen(x.unit) : "未設定（prices.jsonに追加してください）";
-
-    const msg =
-      `🎉 新しい成果が発生しました！\n\n` +
-      `日時: ${x.orderAt}\n` +
-      `案件: ${x.adName || "(不明)"}\n` +
-      `サイト: ${x.siteName || "(不明)"}\n` +
-      `報酬単価: ${unitStr}\n` +
-      `今月の売上合計（現在）: ${fmtYen(monthTotal.revenue)}（${x.monthKey}）\n` +
-      `管理画面を確認する: <${CV_LOG_URL}|管理画面を確認する>`;
-
-    await postSlack(SLACK_WEBHOOK_URL, msg);
-  }
-
-  // 単価未設定があれば追加の警告（任意）
-  if (unknown.length > 0) {
-    const warn =
-      `⚠️ 単価が未設定の広告IDがあります（prices.jsonに追加してください）\n` +
-      unknown.slice(0, 20).map((s) => `- ${s}`).join("\n");
-    await postSlack(SLACK_WEBHOOK_URL, warn);
-  }
-
-  // state保存（seenKeys / monthly）
-  state.seenKeys = pruneSeen((state.seenKeys || []).concat(newOnes.map((x) => x.key)));
-  writeJson(STATE_FILE, state);
-
-  console.log(`[INFO] Notified ${newOnes.length} CV(s) and updated state.`);
 }
 
 main().catch((err) => {
