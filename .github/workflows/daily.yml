@@ -1,0 +1,60 @@
+name: CV Monitor
+
+on:
+  workflow_dispatch:
+  # 動作確認が終わったら↓のコメントを外す（5分おき）
+  # schedule:
+  #   - cron: "*/5 * * * *"
+
+concurrency:
+  group: cv-monitor
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install deps
+        run: npm install
+
+      - name: Run bot
+        env:
+          ADSERVICE_ID: ${{ secrets.ADSERVICE_ID }}
+          ADSERVICE_PASS: ${{ secrets.ADSERVICE_PASS }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          CV_LOG_URL: ${{ secrets.CV_LOG_URL }}
+          # ログインボタンが押せない時だけ追加で使う
+          # SUBMIT_SELECTOR: ${{ secrets.SUBMIT_SELECTOR }}
+        run: node index.js
+
+      - name: Commit & Push if state changed
+        run: |
+          if git diff --quiet -- cv_data.json; then
+            echo "No changes in cv_data.json"
+            exit 0
+          fi
+
+          git config user.name  "cv-monitor-bot"
+          git config user.email "cv-monitor-bot@users.noreply.github.com"
+
+          git add cv_data.json
+          git commit -m "Update CV state [skip ci]"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
