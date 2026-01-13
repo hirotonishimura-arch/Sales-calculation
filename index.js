@@ -63,6 +63,99 @@ async function postSlack(webhookUrl, text) {
     throw new Error(`Slack webhook failed: ${res.status} ${res.statusText} ${body}`);
   }
 }
+// 次ページへ進めるなら進む（色んなUIに対応するため候補を複数試す）
+async function clickNextPage(page) {
+  const selectors = [
+    'a.paginate_button.next:not(.disabled)',
+    'a.next:not(.disabled)',
+    'li.next:not(.disabled) a',
+    'a[rel="next"]',
+    'button[aria-label="Next"]:not([disabled])',
+    'a[aria-label="Next"]:not(.disabled)',
+  ];
+
+  for (const sel of selectors) {
+    const el = await page.$(sel);
+    if (el) {
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "networkidle2" }).catch(() => null),
+        el.click(),
+      ]);
+      await sleep(800);
+      return true;
+    }
+  }
+
+  // 文字で探すフォールバック（次へ/Next）
+  const clicked = await page.evaluate(() => {
+    const isDisabled = (el) => {
+      const cls = (el.getAttribute("class") || "").toLowerCase();
+      if (cls.includes("disabled")) return true;
+      if (el.getAttribute("aria-disabled") === "true") return true;
+      if (el.disabled) return true;
+      return false;
+    };
+
+    const candidates = Array.from(document.querySelectorAll("a,button"));
+    const next = candidates.find((el) => {
+      const t = (el.textContent || "").trim();
+      if (!(t === "次へ" || t === "Next" || t === "›" || t === ">")) return false;
+      if (isDisabled(el)) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    });
+
+    if (!next) return false;
+    next.click();
+    return true;
+  });
+
+  if (clicked) {
+    await sleep(800);
+    return true;
+  }
+  return false;
+}
+function getNowMonthKeyJst() {
+  const d = new Date();
+  const y = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Tokyo", year: "numeric" }).format(d);
+  const m = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Tokyo", month: "2-digit" }).format(d);
+  return `${y}-${m}`;
+}
+
+// “今月分” が尽きる（=前月が出てくる）までページングして集める
+async function collectThisMonthRows(page, headerMap, prices, maxPages = 50) {
+  const targetMonth = getNowMonthKeyJst();
+  const collected = [];
+
+  for (let p = 0; p < maxPages; p++) {
+    const rows = await extractRowsFromBestTable(page, headerMap); // 既にあなたのコードにあるやつ
+    const normalized = rows
+      .map((r) => {
+        const orderAt = norm(r.orderAt);
+        const clickAt = norm(r.clickAt);
+        const adId = norm(r.adId);
+        const adName = norm(r.adName);
+        const siteName = norm(r.siteName);
+        if (!orderAt || !adId) return null;
+        const key = sha1(`${orderAt}|${clickAt}|${adId}|${siteName}`);
+        const monthKey = monthKeyFrom(orderAt);
+        const unit = getUnitPrice(prices, adId);
+        return { key, orderAt, adId, adName, siteName, monthKey, unit };
+      })
+      .filter(Boolean);
+
+    // 今月分だけ加える。前月が出てきたら終了（降順ソート前提）
+    for (const x of normalized) {
+      if (x.monthKey < targetMonth) return collected;
+      if (x.monthKey === targetMonth) collected.push(x);
+    }
+
+    const moved = await clickNextPage(page);
+    if (!moved) return collected;
+  }
+  return collected;
+}
 
 function getUnitPrice(prices, adId) {
   const id = String(adId || "").trim();
@@ -261,24 +354,26 @@ async function main() {
 if (!state.initialized) {
   state.initialized = true;
 
-  // 既存行を全部「既知」として登録
-  state.seenKeys = pruneSeen(
-    (state.seenKeys || []).concat(normalized.map((x) => x.key))
-  );
+  const maxPages = Number(process.env.MAX_PAGES || 50);
+  const monthRows = await collectThisMonthRows(page, headerMap, prices, maxPages);
 
-  // ★ここが追加：月次集計を初期化（既存CVも含める）
+  // seenKeys
+  state.seenKeys = pruneSeen((state.seenKeys || []).concat(monthRows.map((x) => x.key)));
+
+  // monthly 初期化（今月分）
   state.monthly = state.monthly || {};
-  for (const x of normalized) {
-    const cur = state.monthly[x.monthKey] || { revenue: 0, count: 0 };
-    cur.count += 1;
-    cur.revenue += x.unit;
-    state.monthly[x.monthKey] = cur;
+  const nowMonth = getNowMonthKeyJst();
+  state.monthly[nowMonth] = { revenue: 0, count: 0 };
+  for (const x of monthRows) {
+    state.monthly[nowMonth].count += 1;
+    state.monthly[nowMonth].revenue += x.unit;
   }
 
   writeJson(STATE_FILE, state);
-  console.log(`[INFO] Bootstrapped state (no notify). rows=${normalized.length}`);
+  console.log(`[INFO] Bootstrapped month total from ${monthRows.length} rows (no notify).`);
   return;
 }
+
 
 
   if (newOnes.length === 0) {
