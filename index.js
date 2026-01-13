@@ -1,4 +1,4 @@
-// index.js (Node.js 20推奨 / CommonJS)
+// index.js (Node.js 20 / CommonJS)
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
@@ -41,27 +41,20 @@ function fmtYen(n) {
   return `${new Intl.NumberFormat("ja-JP").format(v)}円`;
 }
 
-function monthKeyFrom(orderAtStr) {
-  const s = norm(orderAtStr);
+function monthKeyFrom(dateTimeStr) {
+  const s = norm(dateTimeStr);
   return s.length >= 7 ? s.slice(0, 7) : "unknown";
 }
 
 function getNowMonthKeyJst() {
   const d = new Date();
-  const y = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Tokyo",
-    year: "numeric",
-  }).format(d);
-  const m = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Tokyo",
-    month: "2-digit",
-  }).format(d);
+  const y = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Tokyo", year: "numeric" }).format(d);
+  const m = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Tokyo", month: "2-digit" }).format(d);
   return `${y}-${m}`;
 }
 
 async function postSlack(webhookUrl, text) {
   const payload = { text };
-  // Incoming Webhookは通常チャンネル固定（必要なら後でSlack App側で作り直し）
   if (process.env.SLACK_CHANNEL) payload.channel = process.env.SLACK_CHANNEL;
 
   const res = await fetch(webhookUrl, {
@@ -75,101 +68,47 @@ async function postSlack(webhookUrl, text) {
   }
 }
 
-function getUnitPrice(prices, adId) {
+// prices.json は byAdId が基本。byAdName も任意で対応。
+function getUnitPrice(prices, adId, adName) {
   const id = String(adId || "").trim();
   if (id && prices.byAdId && prices.byAdId[id] != null) return Number(prices.byAdId[id]) || 0;
+
+  const name = String(adName || "").trim();
+  if (name && prices.byAdName && prices.byAdName[name] != null) return Number(prices.byAdName[name]) || 0;
+
   return Number(prices.defaultUnitPrice) || 0;
 }
 
-function pruneSeen(seenKeys, maxItems = 3000) {
-  if (!Array.isArray(seenKeys)) return [];
-  return seenKeys.slice(-maxItems);
+// seenKeys を「重複なし」「新しいもの優先」で保持
+function mergeSeenKeys(prev, add, maxItems = 3000) {
+  const all = (prev || []).concat(add || []);
+  const seen = new Set();
+  const outRev = [];
+  for (let i = all.length - 1; i >= 0; i--) {
+    const k = all[i];
+    if (!k) continue;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    outRev.push(k);
+    if (outRev.length >= maxItems) break;
+  }
+  return outRev.reverse();
+}
+
+function uniqByKey(items) {
+  const s = new Set();
+  const out = [];
+  for (const x of items || []) {
+    if (!x || !x.key) continue;
+    if (s.has(x.key)) continue;
+    s.add(x.key);
+    out.push(x);
+  }
+  return out;
 }
 
 /**
- * 次ページへ進めるなら進む（遷移/非遷移どちらでも耐える）
- */
-async function clickNextPage(page) {
-  const selectors = [
-    'a.paginate_button.next:not(.disabled)',
-    'a.next:not(.disabled)',
-    'li.next:not(.disabled) a',
-    'a[rel="next"]',
-    'button[aria-label="Next"]:not([disabled])',
-    'a[aria-label="Next"]:not(.disabled)',
-  ];
-
-  const beforeFirstRow = await page
-    .evaluate(() => {
-      const tr = document.querySelector("tbody tr");
-      return tr ? (tr.innerText || "") : "";
-    })
-    .catch(() => "");
-
-  async function waitForChangeOrNav() {
-    await Promise.race([
-      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 5000 }).catch(() => null),
-      page
-        .waitForFunction(
-          (prev) => {
-            const tr = document.querySelector("tbody tr");
-            if (!tr) return false;
-            const now = tr.innerText || "";
-            return now && now !== prev;
-          },
-          { timeout: 5000 },
-          beforeFirstRow
-        )
-        .catch(() => null),
-    ]);
-    await sleep(500);
-  }
-
-  // セレクタ優先
-  for (const sel of selectors) {
-    const el = await page.$(sel);
-    if (!el) continue;
-
-    await el.click().catch(() => null);
-    await waitForChangeOrNav();
-    return true;
-  }
-
-  // 文字で探すフォールバック（次へ/Next）
-  const clicked = await page
-    .evaluate(() => {
-      const isDisabled = (el) => {
-        const cls = (el.getAttribute("class") || "").toLowerCase();
-        if (cls.includes("disabled")) return true;
-        if (el.getAttribute("aria-disabled") === "true") return true;
-        if (el.disabled) return true;
-        return false;
-      };
-
-      const candidates = Array.from(document.querySelectorAll("a,button"));
-      const next = candidates.find((el) => {
-        const t = (el.textContent || "").trim();
-        if (!(t === "次へ" || t === "Next" || t === "›" || t === ">")) return false;
-        if (isDisabled(el)) return false;
-        const r = el.getBoundingClientRect();
-        return r.width > 0 && r.height > 0;
-      });
-
-      if (!next) return false;
-      next.click();
-      return true;
-    })
-    .catch(() => false);
-
-  if (clicked) {
-    await waitForChangeOrNav();
-    return true;
-  }
-  return false;
-}
-
-/**
- * CVテーブルが描画されるのを待つ（ヘッダ名で判定）
+ * 画面上のCVテーブルを特定し、行を抜く（必要列は headerMap で指定）
  */
 async function waitForCvTable(page, headerOrderAt, headerAdId, headerAdName) {
   await page.waitForFunction(
@@ -195,9 +134,6 @@ async function waitForCvTable(page, headerOrderAt, headerAdId, headerAdName) {
   );
 }
 
-/**
- * 画面上の「最もそれっぽいテーブル」から行を抜く
- */
 async function extractRowsFromBestTable(page, headerMap) {
   await waitForCvTable(page, headerMap.orderAt, headerMap.adId, headerMap.adName);
 
@@ -206,6 +142,7 @@ async function extractRowsFromBestTable(page, headerMap) {
     const tables = Array.from(document.querySelectorAll("table"));
 
     function headerIndex(headers, target) {
+      if (!target) return -1;
       let i = headers.findIndex((h) => h === target);
       if (i >= 0) return i;
       i = headers.findIndex((h) => h.includes(target));
@@ -214,7 +151,7 @@ async function extractRowsFromBestTable(page, headerMap) {
 
     function scoreTable(t) {
       const headers = Array.from(t.querySelectorAll("thead th")).map((x) => norm(x.textContent));
-      const need = [hm.orderAt, hm.adId, hm.adName, hm.siteName, hm.clickAt];
+      const need = [hm.orderAt, hm.adId, hm.adName, hm.siteName, hm.clickAt, hm.os, hm.referrer];
       let score = 0;
       for (const n of need) {
         if (!n) continue;
@@ -234,19 +171,20 @@ async function extractRowsFromBestTable(page, headerMap) {
 
     const idx = {
       orderAt: headerIndex(headers, hm.orderAt),
-      clickAt: hm.clickAt ? headerIndex(headers, hm.clickAt) : -1,
+      clickAt: headerIndex(headers, hm.clickAt),
       adId: headerIndex(headers, hm.adId),
       adName: headerIndex(headers, hm.adName),
-      siteName: hm.siteName ? headerIndex(headers, hm.siteName) : -1,
+      siteName: headerIndex(headers, hm.siteName),
+      os: headerIndex(headers, hm.os),
+      referrer: headerIndex(headers, hm.referrer),
+      status: headerIndex(headers, hm.status), // キーには使わない（変わる可能性がある）
     };
 
     const rows = Array.from(best.querySelectorAll("tbody tr"));
     const data = [];
-
     for (const tr of rows) {
       const tds = Array.from(tr.querySelectorAll("td")).map((td) => norm(td.textContent));
       if (!tds.length) continue;
-
       const get = (i) => (i >= 0 ? (tds[i] ?? "") : "");
 
       data.push({
@@ -255,131 +193,274 @@ async function extractRowsFromBestTable(page, headerMap) {
         adId: get(idx.adId),
         adName: get(idx.adName),
         siteName: get(idx.siteName),
+        os: get(idx.os),
+        referrer: get(idx.referrer),
+        status: get(idx.status),
+        // rowText: tds.join(" | "), // デバッグに使いたければ
       });
     }
-
     return data;
   }, headerMap);
 }
 
 /**
- * rows -> 正規化（key/unit/monthKey 付与）
+ * キー生成を強化：同秒・同案件が続いても潰れにくいよう
+ * eventAt(注文日時優先/なければクリック日時) + adId/adName + siteName + os + referrer を使う
+ * ※ status は変わり得るので key には入れない
  */
 function normalizeRows(rows, prices) {
-  return rows
+  return (rows || [])
     .map((r) => {
       const orderAt = norm(r.orderAt);
       const clickAt = norm(r.clickAt);
+      const eventAt = orderAt || clickAt;
+
       const adId = norm(r.adId);
       const adName = norm(r.adName);
       const siteName = norm(r.siteName);
+      const os = norm(r.os);
+      const referrer = norm(r.referrer);
 
-      if (!orderAt || !adId) return null;
+      // adId が空でも adName があれば拾う（単価は byAdName でも対応可）
+      const adKey = adId || adName;
+      if (!eventAt || !adKey) return null;
 
-      const key = sha1(`${orderAt}|${clickAt}|${adId}|${siteName}`);
-      const unit = getUnitPrice(prices, adId);
-      const monthKey = monthKeyFrom(orderAt);
+      const unit = getUnitPrice(prices, adId, adName);
+      const monthKey = monthKeyFrom(eventAt);
 
-      return { key, orderAt, clickAt, adId, adName, siteName, unit, monthKey };
+      const keySource = `${eventAt}|${adKey}|${siteName}|${os}|${referrer}|${adName}`;
+      const key = sha1(keySource);
+
+      return { key, eventAt, orderAt, clickAt, adId, adName, siteName, os, referrer, unit, monthKey };
     })
     .filter(Boolean);
 }
 
 /**
- * 初回：今月分が尽きる（=前月が出る）までページングして集める
- * ※ ページに「次へ」が無い場合は 1ページ（最大20件）で終了します。
+ * ページングが本当に進んだか判定するための「テーブル署名」
  */
-async function collectThisMonthRows(page, headerMap, prices, maxPages = 50) {
-  const targetMonth = getNowMonthKeyJst();
-  const collected = [];
+async function getTableSignature(page, headerMap) {
+  return await page
+    .evaluate((hm) => {
+      const norm = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
+      const tables = Array.from(document.querySelectorAll("table"));
 
-  for (let p = 0; p < maxPages; p++) {
-    const rows = await extractRowsFromBestTable(page, headerMap);
-    const normalized = normalizeRows(rows, prices);
+      function scoreTable(t) {
+        const headers = Array.from(t.querySelectorAll("thead th")).map((x) => norm(x.textContent));
+        const need = [hm.orderAt, hm.adId, hm.adName];
+        let score = 0;
+        for (const n of need) {
+          if (!n) continue;
+          if (headers.some((h) => h === n || h.includes(n))) score += 1;
+        }
+        const rows = t.querySelectorAll("tbody tr").length;
+        return score * 1000 + rows;
+      }
 
-    for (const x of normalized) {
-      if (x.monthKey < targetMonth) return collected; // 前月が出たら終了
-      if (x.monthKey === targetMonth) collected.push(x);
-    }
+      const best = tables
+        .map((t) => ({ t, s: scoreTable(t) }))
+        .sort((a, b) => b.s - a.s)[0]?.t;
 
-    const moved = await clickNextPage(page);
-    if (!moved) return collected;
-  }
-  return collected;
+      if (!best) return "";
+
+      const trs = Array.from(best.querySelectorAll("tbody tr"));
+      const first = trs[0]?.innerText || "";
+      const last = trs[trs.length - 1]?.innerText || "";
+      return `${first}||${last}`.slice(0, 2000);
+    }, headerMap)
+    .catch(() => "");
 }
 
 /**
- * 通常運用：新規CVが20件を超える可能性があるので、
- * 「新規がなくなるまで」複数ページを辿って拾う（安全策）
+ * 次ページへ進めるなら進む。進めなかったら false。
  */
-async function collectNewRowsUntilSeen(page, headerMap, prices, seenSet, maxPages = 10) {
-  const collected = [];
+async function clickNextPage(page, headerMap) {
+  const before = await getTableSignature(page, headerMap);
+
+  const selectors = [
+    'a.paginate_button.next:not(.disabled)',
+    'a.next:not(.disabled)',
+    'li.next:not(.disabled) a',
+    'a[rel="next"]',
+    'button[aria-label="Next"]:not([disabled])',
+    'a[aria-label="Next"]:not(.disabled)',
+  ];
+
+  const tryClick = async (fnClick) => {
+    await fnClick();
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 5000 }).catch(() => null),
+      page
+        .waitForFunction(
+          (hm, prev) => {
+            const norm = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
+            const tables = Array.from(document.querySelectorAll("table"));
+
+            function scoreTable(t) {
+              const headers = Array.from(t.querySelectorAll("thead th")).map((x) => norm(x.textContent));
+              const need = [hm.orderAt, hm.adId, hm.adName];
+              let score = 0;
+              for (const n of need) {
+                if (!n) continue;
+                if (headers.some((h) => h === n || h.includes(n))) score += 1;
+              }
+              const rows = t.querySelectorAll("tbody tr").length;
+              return score * 1000 + rows;
+            }
+
+            const best = tables
+              .map((t) => ({ t, s: scoreTable(t) }))
+              .sort((a, b) => b.s - a.s)[0]?.t;
+
+            if (!best) return false;
+            const trs = Array.from(best.querySelectorAll("tbody tr"));
+            const first = trs[0]?.innerText || "";
+            const last = trs[trs.length - 1]?.innerText || "";
+            const sig = `${first}||${last}`.slice(0, 2000);
+            return sig && sig !== prev;
+          },
+          { timeout: 5000 },
+          headerMap,
+          before
+        )
+        .catch(() => null),
+    ]);
+
+    await sleep(300);
+    const after = await getTableSignature(page, headerMap);
+    return after && after !== before;
+  };
+
+  for (const sel of selectors) {
+    const el = await page.$(sel);
+    if (!el) continue;
+    const moved = await tryClick(() => el.click().catch(() => null));
+    if (moved) return true;
+  }
+
+  const movedByText = await tryClick(() =>
+    page.evaluate(() => {
+      const isDisabled = (el) => {
+        const cls = (el.getAttribute("class") || "").toLowerCase();
+        if (cls.includes("disabled")) return true;
+        if (el.getAttribute("aria-disabled") === "true") return true;
+        if (el.disabled) return true;
+        return false;
+      };
+      const candidates = Array.from(document.querySelectorAll("a,button"));
+      const next = candidates.find((el) => {
+        const t = (el.textContent || "").trim();
+        if (!(t === "次へ" || t === "Next" || t === "›" || t === ">")) return false;
+        if (isDisabled(el)) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      if (!next) return false;
+      next.click();
+      return true;
+    })
+  );
+
+  return movedByText;
+}
+
+/**
+ * 初回：今月分を全部拾う（ページの終端まで辿る / “今月が出なくなったら終了”）
+ */
+async function collectThisMonthRows(page, headerMap, prices, maxPages = 50) {
+  const targetMonth = getNowMonthKeyJst();
+  const out = [];
 
   for (let p = 0; p < maxPages; p++) {
     const rows = await extractRowsFromBestTable(page, headerMap);
     const normalized = normalizeRows(rows, prices);
 
-    let newInPage = 0;
-    for (const x of normalized) {
-      if (!seenSet.has(x.key)) {
-        collected.push(x);
-        newInPage += 1;
-      }
-    }
+    const inMonth = normalized.filter((x) => x.monthKey === targetMonth);
+    out.push(...inMonth);
 
-    // このページに新規が1件も無い = もう過去領域なので終了
-    if (newInPage === 0) break;
+    // このページが全部 “前月以前” なら、ここで終わり（並び順が多少怪しくても安全寄り）
+    const hasAny = normalized.length > 0;
+    const allOlder = hasAny && normalized.every((x) => x.monthKey < targetMonth);
+    if (allOlder) break;
 
-    const moved = await clickNextPage(page);
+    const moved = await clickNextPage(page, headerMap);
     if (!moved) break;
   }
 
-  // 念のため重複除去
-  const uniq = [];
-  const ks = new Set();
-  for (const x of collected) {
-    if (!ks.has(x.key)) {
-      ks.add(x.key);
-      uniq.push(x);
+  return uniqByKey(out);
+}
+
+/**
+ * 通常：新規が無くなるまでページを辿る（>20件バースト対策）
+ */
+async function collectNewRowsUntilSeen(page, headerMap, prices, seenSet, maxPages = 10) {
+  const out = [];
+  for (let p = 0; p < maxPages; p++) {
+    const rows = await extractRowsFromBestTable(page, headerMap);
+    const normalized = normalizeRows(rows, prices);
+
+    let newCount = 0;
+    for (const x of normalized) {
+      if (!seenSet.has(x.key)) {
+        out.push(x);
+        newCount++;
+      }
     }
+
+    if (newCount === 0) break;
+
+    const moved = await clickNextPage(page, headerMap);
+    if (!moved) break;
   }
-  return uniq;
+  return uniqByKey(out);
+}
+
+async function detectTotalCountIfPossible(page) {
+  // DataTables系の「xx件中」表示があれば拾ってログに出す（無ければ無視）
+  const txt = await page.$eval(".dataTables_info", (el) => el.textContent || "").catch(() => "");
+  const t = norm(txt);
+  if (!t) return null;
+
+  // 英語: "Showing 1 to 20 of 79 entries"
+  let m = t.match(/of\s+([\d,]+)\s+entries/i);
+  if (m) return parseInt(m[1].replace(/,/g, ""), 10);
+
+  // 日本語: "全79件" や "79件中"
+  m = t.match(/全\s*([\d,]+)\s*件/);
+  if (m) return parseInt(m[1].replace(/,/g, ""), 10);
+
+  m = t.match(/([\d,]+)\s*件中/);
+  if (m) return parseInt(m[1].replace(/,/g, ""), 10);
+
+  return null;
 }
 
 async function main() {
-  // 必須
   const ADSERVICE_ID = mustEnv("ADSERVICE_ID", process.env.ADSERVICE_ID);
   const ADSERVICE_PASS = mustEnv("ADSERVICE_PASS", process.env.ADSERVICE_PASS);
   const SLACK_WEBHOOK_URL = mustEnv("SLACK_WEBHOOK_URL", process.env.SLACK_WEBHOOK_URL);
   const CV_LOG_URL = mustEnv("CV_LOG_URL", process.env.CV_LOG_URL);
 
-  // ログイン情報
   const LOGIN_URL = process.env.LOGIN_URL || "https://admin.adservice.jp/";
-  const AFTER_LOGIN_URL_PREFIX =
-    process.env.AFTER_LOGIN_URL_PREFIX || "https://admin.adservice.jp/partneradmin/";
+  const AFTER_LOGIN_URL_PREFIX = process.env.AFTER_LOGIN_URL_PREFIX || "https://admin.adservice.jp/partneradmin/";
 
   const USERNAME_SELECTOR = process.env.USERNAME_SELECTOR || 'input[name="loginId"]';
   const PASSWORD_SELECTOR = process.env.PASSWORD_SELECTOR || 'input[name="password"]';
-  const SUBMIT_SELECTOR =
-    process.env.SUBMIT_SELECTOR || 'button[type="submit"], input[type="submit"]';
+  const SUBMIT_SELECTOR = process.env.SUBMIT_SELECTOR || 'button[type="submit"], input[type="submit"]';
 
-  // テーブルヘッダー名（必要なら env で上書き）
+  // CV明細テーブルのヘッダ名（必要なら env で上書き）
   const headerMap = {
     orderAt: process.env.HEADER_ORDER_AT || "注文日時",
     clickAt: process.env.HEADER_CLICK_AT || "クリック日時",
     adId: process.env.HEADER_AD_ID || "広告ID",
     adName: process.env.HEADER_AD_NAME || "広告名",
     siteName: process.env.HEADER_SITE_NAME || "サイト名",
+    os: process.env.HEADER_OS || "OS",
+    referrer: process.env.HEADER_REFERRER || "リファラ",
+    status: process.env.HEADER_STATUS || "ステータス",
   };
 
-  // state / prices
-  const state = readJson(STATE_FILE, {
-    version: 1,
-    initialized: false,
-    seenKeys: [],
-    monthly: {},
-    updatedAt: null,
-  });
+  const state = readJson(STATE_FILE, { version: 1, initialized: false, seenKeys: [], monthly: {}, updatedAt: null });
   const prices = readJson(PRICE_FILE, null);
   if (!prices) throw new Error("prices.json not found or invalid");
 
@@ -406,22 +487,29 @@ async function main() {
       page.click(SUBMIT_SELECTOR),
     ]);
 
-    // login success check
     await sleep(800);
     if (!page.url().startsWith(AFTER_LOGIN_URL_PREFIX)) {
       throw new Error(`Login seems failed. current url=${page.url()}`);
     }
 
-    // go cv log page
     await page.goto(CV_LOG_URL, { waitUntil: "networkidle2" });
 
-    // 初回：今月分をページングして月次合計を作る（通知しない）
+    const total = await detectTotalCountIfPossible(page);
+    if (total != null) console.log(`[INFO] Detected total entries (from UI): ${total}`);
+
+    // 初回：今月分をページング収集して月次合計を作る（通知しない）
     if (!state.initialized) {
       const maxPages = Number(process.env.MAX_PAGES || 50);
       const monthRows = await collectThisMonthRows(page, headerMap, prices, maxPages);
 
+      // もし key 衝突がまだ起きてたらログで気づけるように
+      const keyCount = new Map();
+      for (const x of monthRows) keyCount.set(x.key, (keyCount.get(x.key) || 0) + 1);
+      const dup = [...keyCount.entries()].filter(([, c]) => c > 1);
+      if (dup.length > 0) console.warn(`[WARN] Duplicate keys still exist in monthRows: ${dup.length} keys`);
+
       const nowMonth = getNowMonthKeyJst();
-      state.monthly = state.monthly || {};
+      state.monthly ||= {};
       state.monthly[nowMonth] = { revenue: 0, count: 0 };
 
       for (const x of monthRows) {
@@ -429,7 +517,7 @@ async function main() {
         state.monthly[nowMonth].revenue += x.unit;
       }
 
-      state.seenKeys = pruneSeen((state.seenKeys || []).concat(monthRows.map((x) => x.key)));
+      state.seenKeys = mergeSeenKeys(state.seenKeys, monthRows.map((x) => x.key));
       state.initialized = true;
 
       writeJson(STATE_FILE, state);
@@ -437,7 +525,7 @@ async function main() {
       return;
     }
 
-    // 通常：新規CVを複数ページから拾う（>20件対策）
+    // 通常：新規を複数ページから拾う（バースト対策）
     const maxPagesNormal = Number(process.env.MAX_PAGES_NORMAL || 10);
     const newOnes = await collectNewRowsUntilSeen(page, headerMap, prices, seenSet, maxPagesNormal);
 
@@ -446,14 +534,18 @@ async function main() {
       return;
     }
 
-    // 月次合計更新（単価で加算）
-    state.monthly = state.monthly || {};
+    state.monthly ||= {};
     const unknown = [];
 
     for (const x of newOnes) {
-      if (x.unit === 0 && !(prices.byAdId && prices.byAdId[String(x.adId)] != null)) {
-        unknown.push(`${x.adId} ${x.adName}`);
+      if (x.unit === 0) {
+        const id = String(x.adId || "").trim();
+        const name = String(x.adName || "").trim();
+        const hasId = id && prices.byAdId && prices.byAdId[id] != null;
+        const hasName = name && prices.byAdName && prices.byAdName[name] != null;
+        if (!hasId && !hasName) unknown.push(`${x.adId || "(no id)"} ${x.adName || "(no name)"}`);
       }
+
       const cur = state.monthly[x.monthKey] || { revenue: 0, count: 0 };
       cur.count += 1;
       cur.revenue += x.unit;
@@ -467,7 +559,7 @@ async function main() {
 
       const msg =
         `🎉 新しい成果が発生しました！\n\n` +
-        `日時: ${x.orderAt}\n` +
+        `日時: ${x.eventAt}\n` +
         `案件: ${x.adName || "(不明)"}\n` +
         `サイト: ${x.siteName || "(不明)"}\n` +
         `報酬単価: ${unitStr}\n` +
@@ -477,16 +569,14 @@ async function main() {
       await postSlack(SLACK_WEBHOOK_URL, msg);
     }
 
-    // 単価未設定の警告（任意）
     if (unknown.length > 0) {
       const warn =
-        `⚠️ 単価が未設定の広告IDがあります（prices.jsonに追加してください）\n` +
+        `⚠️ 単価が未設定の広告ID/広告名があります（prices.jsonに追加してください）\n` +
         unknown.slice(0, 20).map((s) => `- ${s}`).join("\n");
       await postSlack(SLACK_WEBHOOK_URL, warn);
     }
 
-    // state保存
-    state.seenKeys = pruneSeen((state.seenKeys || []).concat(newOnes.map((x) => x.key)));
+    state.seenKeys = mergeSeenKeys(state.seenKeys, newOnes.map((x) => x.key));
     writeJson(STATE_FILE, state);
 
     console.log(`[INFO] Notified ${newOnes.length} CV(s) and updated state.`);
