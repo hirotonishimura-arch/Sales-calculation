@@ -1,7 +1,34 @@
 {
   "version": 1,
-  "initialized": false,
-  "seenKeys": [],
-  "monthly": {},
-  "updatedAt": null
+  "initialized": true,
+  "seenKeys": [
+    "6d7d1f089ebe2527dbdde973c6ebeeedfdd943e0",
+    "4d45e3d21c709cc24a78f1247d36cd31f7e246f6",
+    "21cd89a02294bbfb67d84ae5828c4ea3bc2675a7",
+    "4d37be3f981d78f0425e20a8aecd459238764fab",
+    "4235a7a803c1905ced0a9184a5dc36a66e8148d4",
+    "dcbd87d7f7738d5d9a817c9e143928305f0a4bfb",
+    "f17debcd4f1d47f93e542a8c3396f1a05c083203",
+    "2feb4d253ecd850621c72b5d3ec2e381726552e6",
+    "47c3b058703a2e7d2cd0bb31ae1bb4c5960c34cd",
+    "3be2b0117263ddc7bda794e6c10e992904ff8358",
+    "5a9c9c1458d360e89b66f9a17549a4f51f33dc73",
+    "5c58a72799aa575da14a750a129e116ba36f49e0",
+    "aad0afdbcf8703f35e775f0ea7ca56534c83b422",
+    "6ff391f8b268a799375ce1dd38aa1ce809704592",
+    "17d8f00ead54e8501442e6372dc792c604908504",
+    "bf10aadd77a99890dc2483ce0d451460b5c29859",
+    "3ae6bc93355eadb5d35a8c6bb4e08dd27e1516a0",
+    "ac6b23361f88a744689d06717f5bdb8d41162a27",
+    "3718791a280a1723b607b6a7db471551d4732438",
+    "09d3d616b084aeae765e806bf26e36719b1c21dc",
+    "a4caa2e6bca8b404353815d00360cf9a55817bc5"
+  ],
+  "monthly": {
+    "2026-01": {
+      "revenue": 50000,
+      "count": 21
+    }
+  },
+  "updatedAt": "2026-01-13T11:02:58.649Z"
 }
