@@ -1,28 +1,7 @@
 {
   "version": 1,
-  "initialized": true,
-  "seenKeys": [
-    "408a5cf33c9eec78938c289b11ff5c1d733efdc7",
-    "36e0e6c6b9d5459012fdf3a0402367f45ab4516b",
-    "b87096328dc1c537d1748803096265e82c889fd8",
-    "6fed07430dc13c092f2cda830be0bdb2d9d6c74e",
-    "636ca8229221ae51e41d55282c2ca1a2d084546f",
-    "e161b7cdd227bd9120b162d128897414d1dd64f8",
-    "bc9e38b5da5080d8d615f48b3586f7a8b2fcb320",
-    "1fce8c554c89638f52fe6a347fd76d2a44093d5b",
-    "e21c515435116dcf308259ff0c4a9ea563b1f574",
-    "f4dca364c066f3c4dc30b46eaf35bb9b86ebeb04",
-    "7b4cf59372490e089bcb150c1e490b51405ecc19",
-    "08bdc2e95b3222bd0d0ddd5a8016d15c22265f61",
-    "6f773aa934f352d9ffe9f014ee28733b8d781980",
-    "30bf20c931dd564fb14cd47ff673cf51ce73f63a",
-    "8bb1f2dde621988312645d69a5275a40113ed2fb",
-    "f7b1bf3f847a69d009a70fd987b1f75d1f30a2f9",
-    "1f09b3db5391c329902e0981470d2b8e25e4e62c",
-    "2b6a8eada086e0f86a14859061e5e590cb0c7901",
-    "5d59a8b4a3e7dbdafd83877972de0a1ad8c1658a",
-    "f3bcbc0fc5e0a08db837dec49447be692a2f6eeb"
-  ],
+  "initialized": false,
+  "seenKeys": [],
   "monthly": {},
   "updatedAt": "2026-01-13T08:50:39.107Z"
 }
