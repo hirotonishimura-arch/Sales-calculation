@@ -1,1 +1,12 @@
+{
+  "name": "sales-calculation",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "puppeteer": "^24.0.0"
+  }
+}
 
