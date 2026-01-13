@@ -7,6 +7,7 @@ const puppeteer = require("puppeteer");
 const ROOT = process.cwd();
 const STATE_FILE = path.join(ROOT, "cv_data.json");
 const PRICE_FILE = path.join(ROOT, "prices.json");
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function mustEnv(name, v) {
   if (!v) throw new Error(`Missing env: ${name}`);
@@ -218,7 +219,7 @@ async function main() {
     ]);
 
     // login success check (URL)
-    await page.waitForTimeout(800);
+    await sleep(800);
     if (!page.url().startsWith(AFTER_LOGIN_URL_PREFIX)) {
       throw new Error(`Login seems failed. current url=${page.url()}`);
     }
